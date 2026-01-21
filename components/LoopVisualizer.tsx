@@ -7,10 +7,26 @@ const NUM_CTRL = 10;
 const SAMPLE_N = 900;
 const MOD_SAMPLE_N = 900;
 const RADIUS = 1.0;
+const QWERTY_NOTE_MAP: Record<string, number> = {
+  a: 60, // C4
+  w: 61,
+  s: 62,
+  e: 63,
+  d: 64,
+  f: 65,
+  t: 66,
+  g: 67,
+  y: 68,
+  h: 69,
+  u: 70,
+  j: 71,
+  k: 72, // C5
+};
 
 // --- Helper Types ---
 type ColorMode = 'phase' | 'curvature';
 type ViewMode = '2d' | '3d';
+type MidiStatus = 'idle' | 'unsupported' | 'connected' | 'error';
 
 interface VisualizerState {
   colorMode: ColorMode;
@@ -81,6 +97,8 @@ function rampCurvatureSigned(x: number) {
   return { r, g, b };
 }
 
+const midiNoteToFrequency = (note: number) => 440 * Math.pow(2, (note - 69) / 12);
+
 const LoopVisualizer: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null);
 
@@ -117,6 +135,10 @@ const LoopVisualizer: React.FC = () => {
   });
 
   const [stats, setStats] = useState<Stats>({ winding: 1.0 });
+  const [midiStatus, setMidiStatus] = useState<MidiStatus>('idle');
+  const [midiInputLabel, setMidiInputLabel] = useState<string>('No device');
+
+  const configRef = useRef(config);
 
   // -- Audio Refs --
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -125,6 +147,8 @@ const LoopVisualizer: React.FC = () => {
   const audioPhaseRef = useRef<number>(0);
   const audioPhaseRefR = useRef<number>(0); // Independent phase for Right/Unison channel
   const modPhaseRef = useRef<number>(0);
+  const midiAccessRef = useRef<any>(null);
+  const activeNotesRef = useRef<number[]>([]);
 
   // -- Scene Context --
   const sceneContext = useRef<{
@@ -166,6 +190,7 @@ const LoopVisualizer: React.FC = () => {
 
   // Sync React state to the mutable config ref & Update Audio
   useEffect(() => {
+    configRef.current = config;
     if (sceneContext.current) {
       const ctx = sceneContext.current;
       const prevConfig = ctx.config;
@@ -217,22 +242,21 @@ const LoopVisualizer: React.FC = () => {
 
 
   // --- Audio Logic ---
-  const toggleAudio = () => {
-      if (!config.audioEnabled) {
-          // Init Audio
-          const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-          const ctx = new Ctx();
-          audioCtxRef.current = ctx;
+  const startAudio = () => {
+      if (audioCtxRef.current) return;
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new Ctx();
+      audioCtxRef.current = ctx;
 
-          const gain = ctx.createGain();
-          gain.gain.value = config.audioGain;
-          gain.connect(ctx.destination);
-          gainNodeRef.current = gain;
+      const gain = ctx.createGain();
+      gain.gain.value = configRef.current.audioGain;
+      gain.connect(ctx.destination);
+      gainNodeRef.current = gain;
 
-          const bufferSize = 4096;
-          const processor = ctx.createScriptProcessor(bufferSize, 0, 2);
-          
-          processor.onaudioprocess = (e) => {
+      const bufferSize = 4096;
+      const processor = ctx.createScriptProcessor(bufferSize, 0, 2);
+      
+      processor.onaudioprocess = (e) => {
               const L = e.outputBuffer.getChannelData(0);
               const R = e.outputBuffer.getChannelData(1);
               const sCtx = sceneContext.current;
@@ -363,24 +387,155 @@ const LoopVisualizer: React.FC = () => {
                   sCtx.audioVizData.left.set(L.subarray(0, captureLen));
                   sCtx.audioVizData.right.set(R.subarray(0, captureLen));
               }
-          };
+      };
 
-          processor.connect(gain);
-          scriptNodeRef.current = processor;
-          setConfig(p => ({...p, audioEnabled: true}));
-      } else {
-          // Cleanup Audio
-          if (audioCtxRef.current) {
-              audioCtxRef.current.close();
-              audioCtxRef.current = null;
-          }
-          if (scriptNodeRef.current) {
-              scriptNodeRef.current.disconnect();
-              scriptNodeRef.current = null;
-          }
-          setConfig(p => ({...p, audioEnabled: false}));
+      processor.connect(gain);
+      scriptNodeRef.current = processor;
+      setConfig(p => ({...p, audioEnabled: true}));
+  };
+
+  const stopAudio = () => {
+      if (audioCtxRef.current) {
+          audioCtxRef.current.close();
+          audioCtxRef.current = null;
+      }
+      if (scriptNodeRef.current) {
+          scriptNodeRef.current.disconnect();
+          scriptNodeRef.current = null;
+      }
+      setConfig(p => ({...p, audioEnabled: false}));
+  };
+
+  const toggleAudio = () => {
+      if (audioCtxRef.current) {
+          stopAudio();
+          return;
+      }
+      startAudio();
+  };
+
+  const setFrequencyFromNote = (note: number) => {
+      const freq = midiNoteToFrequency(note);
+      setConfig(prev => (prev.audioFreq === freq ? prev : { ...prev, audioFreq: freq }));
+  };
+
+  const registerActiveNote = (note: number) => {
+      const active = activeNotesRef.current;
+      const existingIndex = active.indexOf(note);
+      if (existingIndex !== -1) {
+          active.splice(existingIndex, 1);
+      }
+      active.push(note);
+  };
+
+  const unregisterActiveNote = (note: number) => {
+      const active = activeNotesRef.current;
+      const index = active.indexOf(note);
+      if (index !== -1) {
+          active.splice(index, 1);
+      }
+      const last = active[active.length - 1];
+      if (last !== undefined) {
+          setFrequencyFromNote(last);
       }
   };
+
+  useEffect(() => {
+      const requestMidi = (navigator as any).requestMIDIAccess;
+      if (!requestMidi) {
+          setMidiStatus('unsupported');
+          return;
+      }
+
+      let isMounted = true;
+
+      const handleMidiMessage = (event: any) => {
+          if (!event?.data) return;
+          const [status, note, velocity] = event.data;
+          const command = status & 0xf0;
+          if (command === 0x90 && velocity > 0) {
+              startAudio();
+              registerActiveNote(note);
+              setFrequencyFromNote(note);
+          } else if (command === 0x80 || (command === 0x90 && velocity === 0)) {
+              unregisterActiveNote(note);
+          }
+      };
+
+      const attachInputs = (access: any) => {
+          const inputs = Array.from(access.inputs?.values?.() ?? []);
+          if (inputs.length === 0) {
+              setMidiInputLabel('No device');
+          } else if (inputs.length === 1) {
+              setMidiInputLabel(inputs[0]?.name || 'MIDI device');
+          } else {
+              setMidiInputLabel(`${inputs.length} devices`);
+          }
+          inputs.forEach((input: any) => {
+              input.onmidimessage = handleMidiMessage;
+          });
+      };
+
+      requestMidi()
+          .then((access: any) => {
+              if (!isMounted) return;
+              midiAccessRef.current = access;
+              setMidiStatus('connected');
+              attachInputs(access);
+              access.onstatechange = () => attachInputs(access);
+          })
+          .catch(() => {
+              if (!isMounted) return;
+              setMidiStatus('error');
+          });
+
+      return () => {
+          isMounted = false;
+          if (midiAccessRef.current) {
+              midiAccessRef.current.onstatechange = null;
+              midiAccessRef.current.inputs?.forEach?.((input: any) => {
+                  input.onmidimessage = null;
+              });
+          }
+      };
+  }, []);
+
+  useEffect(() => {
+      const shouldIgnoreKey = (event: KeyboardEvent) => {
+          const target = event.target as HTMLElement | null;
+          if (!target) return false;
+          const tag = target.tagName;
+          return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+      };
+
+      const handleKeyDown = (event: KeyboardEvent) => {
+          if (event.repeat || shouldIgnoreKey(event)) return;
+          const key = event.key.toLowerCase();
+          const note = QWERTY_NOTE_MAP[key];
+          if (note === undefined) return;
+          event.preventDefault();
+          startAudio();
+          registerActiveNote(note);
+          setFrequencyFromNote(note);
+      };
+
+      const handleKeyUp = (event: KeyboardEvent) => {
+          if (shouldIgnoreKey(event)) return;
+          const key = event.key.toLowerCase();
+          const note = QWERTY_NOTE_MAP[key];
+          if (note === undefined) return;
+          event.preventDefault();
+          unregisterActiveNote(note);
+      };
+
+      window.addEventListener('keydown', handleKeyDown);
+      window.addEventListener('keyup', handleKeyUp);
+
+      return () => {
+          window.removeEventListener('keydown', handleKeyDown);
+          window.removeEventListener('keyup', handleKeyUp);
+      };
+  }, []);
 
 
   // --- Three.js Logic Functions ---
@@ -983,6 +1138,20 @@ const LoopVisualizer: React.FC = () => {
       }
   };
 
+  const midiStatusLabel = {
+      idle: 'Waiting',
+      unsupported: 'Unavailable',
+      connected: 'Connected',
+      error: 'Error',
+  }[midiStatus];
+
+  const midiStatusClass = {
+      idle: 'text-slate-400 border-slate-600/40 bg-slate-800/60',
+      unsupported: 'text-amber-300 border-amber-500/30 bg-amber-500/10',
+      connected: 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10',
+      error: 'text-rose-300 border-rose-500/30 bg-rose-500/10',
+  }[midiStatus];
+
 
   return (
     <div className="relative w-full h-full">
@@ -1106,6 +1275,21 @@ const LoopVisualizer: React.FC = () => {
                     </div>
                   </>
                 )}
+                <div className="mt-3 rounded-lg border border-white/5 bg-slate-900/60 px-3 py-2 text-[10px] text-slate-400">
+                    <div className="flex items-center justify-between">
+                        <span className="uppercase tracking-widest">MIDI Input</span>
+                        <span className={`px-2 py-0.5 rounded-full border text-[9px] font-semibold ${midiStatusClass}`}>
+                            {midiStatusLabel}
+                        </span>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
+                        <span>Device</span>
+                        <span className="text-slate-300">{midiInputLabel}</span>
+                    </div>
+                    <div className="mt-1 text-[10px] text-slate-500">
+                        QWERTY: <span className="text-slate-300">A W S E D F T G Y H U J K</span>
+                    </div>
+                </div>
             </div>
 
             {/* Topological FM Group */}
