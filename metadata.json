@@ -1,0 +1,5 @@
+{
+  "name": "Loop Visualizer",
+  "description": "An interactive 3D WebGL visualization of a spline loop. Experiment with phase and curvature encoding, 2D/3D projections, and real-time deformation.",
+  "requestFramePermissions": []
+}
